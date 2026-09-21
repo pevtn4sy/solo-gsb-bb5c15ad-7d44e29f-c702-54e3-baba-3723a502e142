@@ -19,6 +19,8 @@ from fastapi import FastAPI, HTTPException
 
 from . import db
 from .schemas import (
+    AdvanceBatchOut,
+    AdvanceBatchRequest,
     AdvanceOut,
     AdvanceRequest,
     CompleteOut,
@@ -41,7 +43,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Crossover Experiment Order Balancer",
     description="基于 Williams 平衡拉丁方的交叉实验顺序分配与按周期受控揭盲服务",
-    version="1.2.0",
+    version="1.3.0",
     lifespan=lifespan,
 )
 
@@ -234,6 +236,66 @@ def advance_period(experiment_id: str, payload: AdvanceRequest) -> dict:
                 "message": "实验或受试者不存在",
                 "experiment_id": experiment_id,
                 "subject_id": payload.subject_id,
+            },
+        )
+    return result
+
+
+@app.post(
+    "/experiments/{experiment_id}/advance-batch",
+    response_model=AdvanceBatchOut,
+    summary=(
+        "批量受控揭盲：单事务校验全部成员的完成登记与洗脱期门禁，"
+        "全部通过才按输入顺序揭盲并推进，任一失败整批零写入"
+    ),
+)
+def advance_batch(experiment_id: str, payload: AdvanceBatchRequest) -> dict:
+    subject_ids = [m.subject_id for m in payload.members]
+    if len(set(subject_ids)) != len(subject_ids):
+        raise HTTPException(
+            status_code=422, detail="members 内 subject_id 必须互异（存在重复受试者）"
+        )
+
+    try:
+        result = db.advance_batch(
+            experiment_id,
+            [
+                {
+                    "subject_id": m.subject_id,
+                    "expected_period": m.expected_period,
+                }
+                for m in payload.members
+            ],
+            payload.batch_id,
+        )
+    except db.BatchIdConflictError:
+        # 同一批次幂等键却绑定了不同的成员或周期
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "batch_id 已被成员或周期不同的请求占用",
+                "reason": "batch_id_conflict",
+                "batch_id": payload.batch_id,
+            },
+        )
+    except db.BatchValidationError as exc:
+        # 任一成员未通过门禁：列出各失败项（不含条件），整批零写入
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "批量推进校验未通过，整批未写入",
+                "reason": "batch_validation_failed",
+                "batch_id": payload.batch_id,
+                "failures": exc.failures,
+            },
+        )
+
+    if result is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "message": "实验不存在",
+                "experiment_id": experiment_id,
             },
         )
     return result

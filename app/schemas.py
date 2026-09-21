@@ -77,6 +77,46 @@ class AdvanceOut(BaseModel):
     revealed_at: str
 
 
+class AdvanceBatchMember(BaseModel):
+    """批量推进中的单个成员：受试者及其预期下一周期。"""
+
+    subject_id: str = Field(..., min_length=1, description="受试者 ID")
+    expected_period: int = Field(
+        ...,
+        ge=1,
+        description="调用方认为该受试者所处的下一周期（从 1 开始）",
+    )
+
+
+class AdvanceBatchRequest(BaseModel):
+    """批量受控揭盲请求：1～100 个互异受试者，整批原子推进。"""
+
+    batch_id: str = Field(
+        ..., min_length=1, description="批次幂等键，相同 batch_id 重试返回首次结果"
+    )
+    members: list[AdvanceBatchMember] = Field(
+        ...,
+        min_length=1,
+        max_length=100,
+        description="1～100 个成员，subject_id 必须互异",
+    )
+
+
+class AdvanceBatchItemOut(BaseModel):
+    """批量推进中单个成员的揭盲结果。"""
+
+    subject_id: str
+    period: int
+    condition: str
+    revealed_at: str
+
+
+class AdvanceBatchOut(BaseModel):
+    experiment_id: str
+    batch_id: str
+    results: list[AdvanceBatchItemOut]
+
+
 class CompleteRequest(BaseModel):
     """周期完成登记请求。"""
 

@@ -18,12 +18,15 @@
   （`assignments[].subject_id`）与条件清单，不包含任何人的条件序列或序列下标；
 - 通过推进接口逐周期揭盲：提交 `subject_id`、`expected_period` 与 `request_id`，
   **仅当 `expected_period` 正好等于该受试者的下一周期**时返回当前周期条件并原子推进；
+- 也可通过批量推进接口 `POST /experiments/{id}/advance-batch` 一次推进 1～100 个
+  互异受试者：**单事务内校验全部成员**，全部通过才按输入顺序揭盲，任一失败整批零写入；
 - **周期完成 + 洗脱期门禁**：每个周期揭盲后必须调用完成接口
   `POST /experiments/{id}/complete` 登记完成时间；推进下一周期（周期 ≥ 2）前，
   服务端校验上一周期已存在完成记录，且服务端当前时间已达到
-  `completed_at + washout_seconds`，缺一不可；
+  `completed_at + washout_seconds`，缺一不可（单人与批量推进适用同一套门禁）；
 - 相同 `request_id` 重试（接口超时、网络重试等）返回**首次结果**且不重复写入；
   同一 `request_id` 绑定不同受试者或周期返回 `409`（推进与完成使用各自独立的幂等空间）；
+  批量推进使用独立的 `batch_id` 幂等空间，语义相同；
 - 并发请求或过期周期（落后 / 超前 / 实验已结束）返回 `409`，冲突路径不写入、不多揭露任何条件；
 - 进度查询只返回**已揭盲记录（含各自的 `completed_at`）**、`next_period` 与
   `next_available_at`（下一周期最早可推进时间），不暴露后续周期安排。
@@ -36,7 +39,8 @@ docker compose up --build
 
 该命令会构建镜像并启动容器：构建时安装依赖，容器启动命令中再次校验依赖安装，
 应用启动钩子（lifespan）自动完成 SQLite 建表与迁移。**旧版本数据库无需手工迁移**：
-启动时新增的进度、揭盲、周期完成、幂等表通过 `CREATE TABLE IF NOT EXISTS` 自动补齐，
+启动时新增的进度、揭盲、周期完成、幂等表（含批量推进的 `advance_batches`）通过
+`CREATE TABLE IF NOT EXISTS` 自动补齐，
 `experiments` 表新增的 `washout_seconds` 列通过幂等的 `ALTER TABLE ... DEFAULT 0`
 补齐——**旧实验一律按 0 秒洗脱期处理**，旧数据保留且可继续揭盲与登记完成。
 
@@ -154,6 +158,69 @@ curl -X POST http://localhost:8000/experiments/<experiment_id>/advance \
 幂等语义：相同 `(实验, request_id)` 且相同请求体重试，返回**首次的条件与 `revealed_at`**，
 即使此时受试者已经推进到更后面的周期，也不会重复推进或改写历史。
 
+### 批量推进揭盲 `POST /experiments/{experiment_id}/advance-batch`
+
+一次推进多个受试者，请求体：
+
+| 字段 | 说明 |
+| --- | --- |
+| `batch_id` | 批次幂等键（如 UUID），同一批次重试必须复用 |
+| `members` | 1～100 个成员，每项为 `subject_id` + `expected_period`；`subject_id` 必须互异 |
+
+```bash
+curl -X POST http://localhost:8000/experiments/<experiment_id>/advance-batch \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "batch_id": "3b9e…",
+        "members": [
+          {"subject_id": "s1", "expected_period": 2},
+          {"subject_id": "s2", "expected_period": 2}
+        ]
+      }'
+```
+
+在**单个 SQLite 写事务**内先逐成员校验与单人推进完全相同的门禁
+（`expected_period` 须为各自下一周期、上一周期已登记完成、洗脱期已届满），
+**全部通过**才按输入顺序揭盲并推进，返回 `200`，`results` 与请求成员顺序一致，
+整批共用同一 `revealed_at`：
+
+```json
+{
+  "experiment_id": "…",
+  "batch_id": "3b9e…",
+  "results": [
+    {"subject_id": "s1", "period": 2, "condition": "B", "revealed_at": "2026-09-22T10:00:00.000000+00:00"},
+    {"subject_id": "s2", "period": 2, "condition": "A", "revealed_at": "2026-09-22T10:00:00.000000+00:00"}
+  ]
+}
+```
+
+**任一成员失败则整批 `409` 且零写入**（其他成员不受影响、不揭露任何条件），
+`detail.failures` 按输入顺序列出各失败项的 `subject_id` 与原因（不含条件）：
+
+```json
+{
+  "detail": {
+    "message": "批量推进校验未通过，整批未写入",
+    "reason": "batch_validation_failed",
+    "batch_id": "3b9e…",
+    "failures": [
+      {"subject_id": "s2", "reason": "washout_not_elapsed", "retry_after_seconds": 120}
+    ]
+  }
+}
+```
+
+- 失败项的 `reason` 与单人推进一致：`period_mismatch` / `experiment_complete`
+  （附 `next_period`）、`prior_period_not_completed`、`washout_not_elapsed`
+  （附 `retry_after_seconds`），另有 `subject_not_found`（受试者不在实验中）；
+- 校验失败的批次**不消耗 `batch_id`**：修正条件后用同一 `batch_id` 重试即按首次成功处理；
+- 幂等语义：相同 `(实验, batch_id)` 且成员与周期完全一致的重试返回**首次结果**
+  （含首次的条件与 `revealed_at`），不重复推进；同一 `batch_id` 绑定不同成员或周期
+  返回 `409`（`batch_id_conflict`）。`batch_id` 与推进 / 完成接口的 `request_id`
+  是各自独立的幂等空间；
+- 成员数量不在 1～100、`subject_id` 重复或字段非法返回 `422`；实验不存在返回 `404`。
+
 ### 登记周期完成 `POST /experiments/{experiment_id}/complete`
 
 每个周期揭盲结束后调用，服务端以自身当前时间登记完成时刻：
@@ -241,16 +308,21 @@ uvicorn app.main:app --reload  # 本地启动，默认 http://127.0.0.1:8000
 - **确定性分配**（`app/main.py`）：将完整序列组复制 `受试者数 / 组大小` 份构成序列池，
   用 `random.Random(seed)` 打乱后依次映射给受试者，因此相同输入与种子结果一致。
   序列只写入服务端存储，不进入创建 / 详情响应。
-- **存储**（`app/db.py`，SQLite）共七张表，启动时幂等迁移（旧库自动补齐）：
+- **存储**（`app/db.py`，SQLite）共八张表，启动时幂等迁移（旧库自动补齐）：
   - `experiments`：含 `washout_seconds`（旧库缺列时 `ALTER TABLE ... DEFAULT 0` 补齐）；
   - `assignments`：受试者完整序列（服务端持有）；
   - `subject_progress`：每受试者的 `next_period`；
   - `unblindings`：已揭盲记录（周期 → 条件，含幂等键与时间戳）；
   - `period_completions`：周期完成记录（周期 → `completed_at`，主键冲突即重复完成）；
   - `advance_requests` / `completion_requests`：推进与完成各自按
-    `(实验, request_id)` 唯一约束保存首次结果，支持重放。
+    `(实验, request_id)` 唯一约束保存首次结果，支持重放；
+  - `advance_batches`：批量推进按 `(实验, batch_id)` 唯一约束保存首次请求的
+    成员 / 周期与首次揭盲结果，支持整批重放。
 - **原子推进与完成门禁**：推进与完成都在单个 `BEGIN IMMEDIATE` 事务内完成
   “幂等检查 → 顺序 / 周期校验 → 写入并提交”，配合 `busy_timeout` 让并发请求串行化：
   每个周期只有一个完成请求、一次推进成功，其余得到 `409`；推进时**服务端时间在锁内读取**，
   与并发的完成登记互斥，`completed_at + washout_seconds` 的判断与揭盲写入原子一致；
   任何失败路径整体回滚，不会绕过门禁或多揭露条件。
+- **批量推进**同样在单个 `BEGIN IMMEDIATE` 事务内完成“批次幂等检查 → 逐成员
+  门禁校验（只读）→ 全部通过才按输入顺序写入并提交”：任一成员失败即整体回滚，
+  整批零写入；并发批次对同一批受试者只有一个赢家，其余得到 `409`。
