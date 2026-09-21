@@ -19,6 +19,8 @@ from fastapi import FastAPI, HTTPException
 
 from . import db
 from .schemas import (
+    AdvanceBatchOut,
+    AdvanceBatchRequest,
     AdvanceOut,
     AdvanceRequest,
     CompleteOut,
@@ -41,7 +43,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Crossover Experiment Order Balancer",
     description="基于 Williams 平衡拉丁方的交叉实验顺序分配与按周期受控揭盲服务",
-    version="1.2.0",
+    version="1.3.0",
     lifespan=lifespan,
 )
 
@@ -236,6 +238,48 @@ def advance_period(experiment_id: str, payload: AdvanceRequest) -> dict:
                 "subject_id": payload.subject_id,
             },
         )
+    return result
+
+
+@app.post(
+    "/experiments/{experiment_id}/advance-batch",
+    response_model=AdvanceBatchOut,
+    summary=(
+        "批量受控揭盲：单个写事务内校验全部成员的完成登记与洗脱期门禁，"
+        "全部通过才按输入顺序揭盲并推进；任一项失败整批零写入并返回 409"
+    ),
+)
+def advance_batch(experiment_id: str, payload: AdvanceBatchRequest) -> dict:
+    try:
+        result = db.advance_batch(
+            experiment_id,
+            payload.batch_id,
+            [m.model_dump() for m in payload.members],
+        )
+    except db.BatchIdConflictError:
+        # 同一 batch_id 绑定了不同的成员或周期
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "batch_id 已被成员或周期不同的其他请求占用",
+                "reason": "batch_id_conflict",
+                "batch_id": payload.batch_id,
+            },
+        )
+    except db.BatchMembersRejectedError as exc:
+        # 整批门禁未通过：只列各失败项的 subject_id 与原因，不含任何条件
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "批量中存在未通过门禁的成员，整批未揭盲",
+                "reason": "batch_member_rejected",
+                "batch_id": payload.batch_id,
+                "failures": exc.failures,
+            },
+        )
+
+    if result is None:
+        raise HTTPException(status_code=404, detail="experiment not found")
     return result
 
 

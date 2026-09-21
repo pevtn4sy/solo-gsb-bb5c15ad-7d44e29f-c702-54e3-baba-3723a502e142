@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class ExperimentCreate(BaseModel):
@@ -75,6 +75,56 @@ class AdvanceOut(BaseModel):
     condition: str
     request_id: str
     revealed_at: str
+
+
+class AdvanceBatchMember(BaseModel):
+    """批量揭盲中的一个成员：受试者与其预期下一周期。"""
+
+    subject_id: str = Field(..., min_length=1, description="受试者 ID")
+    expected_period: int = Field(
+        ...,
+        ge=1,
+        description="调用方认为该受试者所处的下一周期（从 1 开始）",
+    )
+
+
+class AdvanceBatchRequest(BaseModel):
+    """批量受控揭盲请求：1～100 个互异的 subject_id / expected_period 对。"""
+
+    batch_id: str = Field(
+        ...,
+        min_length=1,
+        description="批量幂等键，相同 batch_id 与相同成员列表重试返回首次结果",
+    )
+    members: list[AdvanceBatchMember] = Field(
+        ...,
+        min_length=1,
+        max_length=100,
+        description="批量成员（1～100 个），按该列表顺序揭盲与推进",
+    )
+
+    @model_validator(mode="after")
+    def _members_must_be_distinct(self) -> "AdvanceBatchRequest":
+        seen: set[tuple[str, int]] = set()
+        for member in self.members:
+            key = (member.subject_id, member.expected_period)
+            if key in seen:
+                raise ValueError(
+                    "members 必须互异：存在重复的 subject_id / expected_period"
+                )
+            seen.add(key)
+        return self
+
+
+class AdvanceBatchItemOut(AdvanceOut):
+    """批量揭盲中单个成员的揭盲结果。"""
+
+
+class AdvanceBatchOut(BaseModel):
+    experiment_id: str
+    batch_id: str
+    # 结果严格按请求 members 的输入顺序返回
+    results: list[AdvanceBatchItemOut]
 
 
 class CompleteRequest(BaseModel):

@@ -962,6 +962,440 @@ def test_concurrent_advance_after_completion_has_single_winner(
     assert len(progress["reveals"]) == 2
 
 
+# ---------- 批量受控揭盲 ----------
+
+def advance_batch(
+    client: TestClient,
+    experiment_id: str,
+    members: list[dict],
+    batch_id: str,
+):
+    return client.post(
+        f"/experiments/{experiment_id}/advance-batch",
+        json={"batch_id": batch_id, "members": members},
+    )
+
+
+def test_batch_advances_all_members_in_input_order(client: TestClient) -> None:
+    body, _ = create_experiment(
+        client, conditions=["A", "B"], subject_ids=["s1", "s2"], seed=5
+    )
+    eid = body["experiment_id"]
+
+    members = [
+        {"subject_id": "s2", "expected_period": 1},
+        {"subject_id": "s1", "expected_period": 1},
+    ]
+    resp = advance_batch(client, eid, members, "batch-1")
+    assert resp.status_code == 200, resp.text
+    batch = resp.json()
+    assert batch["experiment_id"] == eid
+    assert batch["batch_id"] == "batch-1"
+    assert [r["subject_id"] for r in batch["results"]] == ["s2", "s1"]
+    for result, member in zip(batch["results"], members):
+        assert result["period"] == 1
+        assert result["condition"] in {"A", "B"}
+        assert result["request_id"].startswith("batch:batch-1:")
+        assert "revealed_at" in result
+
+    # 进度按整批推进
+    for subject_id in ("s1", "s2"):
+        progress = client.get(f"/experiments/{eid}/subjects/{subject_id}/progress").json()
+        assert progress["next_period"] == 2
+        assert len(progress["reveals"]) == 1
+        assert progress["reveals"][0]["completed_at"] is None
+
+
+def test_batch_allows_adjacent_periods_of_same_subject_in_order(
+    client: TestClient,
+) -> None:
+    # 同一受试者的相邻周期可放在同一批中：周期 1 揭盲后需先完成才能揭盲周期 2，
+    # 因此只有在之前已登记周期 1 完成时整批才通过
+    body, _ = create_experiment(
+        client, conditions=["A", "B"], subject_ids=["s1", "s2"], seed=5
+    )
+    eid = body["experiment_id"]
+    first = client.post(
+        f"/experiments/{eid}/advance",
+        json={"subject_id": "s1", "expected_period": 1, "request_id": "a1"},
+    ).json()
+    assert complete_period(client, eid, "s1", 1, "c1").status_code == 200
+
+    members = [
+        {"subject_id": "s1", "expected_period": 2},
+        {"subject_id": "s2", "expected_period": 1},
+    ]
+    resp = advance_batch(client, eid, members, "batch-multi")
+    assert resp.status_code == 200, resp.text
+    results = resp.json()["results"]
+    assert [r["subject_id"] for r in results] == ["s1", "s2"]
+    assert [r["period"] for r in results] == [2, 1]
+    # 顺序揭盲：s1 的周期 2 条件即其完整序列第二项，与历史一致
+    assert results[0]["condition"] != first["condition"]
+
+
+def test_batch_failure_is_atomic_and_lists_failures_without_conditions(
+    client: TestClient,
+) -> None:
+    body, _ = create_experiment(
+        client, conditions=["A", "B"], subject_ids=["s1", "s2"], seed=5
+    )
+    eid = body["experiment_id"]
+    # s1 先揭盲周期 1，但不登记完成
+    assert client.post(
+        f"/experiments/{eid}/advance",
+        json={"subject_id": "s1", "expected_period": 1, "request_id": "a1"},
+    ).status_code == 200
+
+    members = [
+        # s2 周期 1：本应通过
+        {"subject_id": "s2", "expected_period": 1},
+        # s1 周期 2：上一周期未完成 → 拒绝
+        {"subject_id": "s1", "expected_period": 2},
+        # ghost：受试者不存在 → 拒绝
+        {"subject_id": "ghost", "expected_period": 1},
+    ]
+    resp = advance_batch(client, eid, members, "batch-fail")
+    assert resp.status_code == 409
+    detail = resp.json()["detail"]
+    assert detail["reason"] == "batch_member_rejected"
+    assert detail["batch_id"] == "batch-fail"
+    failures = detail["failures"]
+    assert {f["subject_id"]: f["reason"] for f in failures} == {
+        "s1": "prior_period_not_completed",
+        "ghost": "subject_not_found",
+    }
+    # 失败项保持输入顺序（s1 在 ghost 之前）
+    assert [f["subject_id"] for f in failures] == ["s1", "ghost"]
+    # 任何失败项都不得携带条件信息
+    assert_no_sequence_leak(detail)
+
+    # 整批零写入：s2 也未被揭盲
+    progress = client.get(f"/experiments/{eid}/subjects/s2/progress").json()
+    assert progress["next_period"] == 1
+    assert progress["reveals"] == []
+    # 失败不消耗 batch_id：修正成员后同 batch_id 首次成功
+    ok = advance_batch(
+        client,
+        eid,
+        [{"subject_id": "s2", "expected_period": 1}],
+        "batch-fail",
+    )
+    assert ok.status_code == 200, ok.text
+    assert ok.json()["results"][0]["subject_id"] == "s2"
+
+
+def test_batch_reports_period_mismatch_and_experiment_complete(
+    client: TestClient,
+) -> None:
+    body, _ = create_experiment(
+        client, conditions=["A", "B"], subject_ids=["s1", "s2"], seed=8
+    )
+    eid = body["experiment_id"]
+    reveal_sequence(client, eid, "s1", 2)  # s1 已完成全部周期
+
+    resp = advance_batch(
+        client,
+        eid,
+        [
+            {"subject_id": "s2", "expected_period": 2},   # 超前 → mismatch
+            {"subject_id": "s1", "expected_period": 3},   # 已结束
+        ],
+        "batch-stale",
+    )
+    assert resp.status_code == 409
+    reasons = {f["subject_id"]: f for f in resp.json()["detail"]["failures"]}
+    assert reasons["s2"]["reason"] == "period_mismatch"
+    assert reasons["s2"]["next_period"] == 1
+    assert reasons["s1"]["reason"] == "experiment_complete"
+    assert reasons["s1"]["next_period"] == 3
+    assert_no_sequence_leak(resp.json())
+
+
+def test_batch_washout_failure_returns_retry_after_and_zero_writes(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setenv("DATABASE_PATH", str(tmp_path / "batch-washout.db"))
+    t0 = datetime(2026, 9, 21, 8, 0, 0, tzinfo=timezone.utc)
+
+    class Clock:
+        def __init__(self) -> None:
+            self.now = t0
+
+        def __call__(self) -> datetime:
+            return self.now
+
+    clock = Clock()
+    monkeypatch.setattr(db, "utc_now", clock)
+
+    with TestClient(app) as local:
+        created = local.post(
+            "/experiments",
+            json={
+                "conditions": ["A", "B"],
+                "subject_ids": ["s1", "s2"],
+                "seed": 1,
+                "washout_seconds": 3600,
+            },
+        ).json()
+        eid = created["experiment_id"]
+        # s1 已揭盲周期 1，并在 2 分钟后登记完成（距洗脱期届满还差 3480 秒）
+        local.post(
+            f"/experiments/{eid}/advance",
+            json={"subject_id": "s1", "expected_period": 1, "request_id": "a1"},
+        )
+        clock.now += timedelta(seconds=120)
+        assert local.post(
+            f"/experiments/{eid}/complete",
+            json={"subject_id": "s1", "period": 1, "request_id": "c1"},
+        ).status_code == 200
+
+        # 再走 240 秒：完成于 t0+120，门禁时刻 t0+360，距届满还差 3360 秒
+        clock.now += timedelta(seconds=240)
+        resp = advance_batch(
+            local,
+            eid,
+            [
+                {"subject_id": "s1", "expected_period": 2},
+                {"subject_id": "s2", "expected_period": 1},
+            ],
+            "batch-w",
+        )
+        assert resp.status_code == 409
+        failures = resp.json()["detail"]["failures"]
+        assert len(failures) == 1
+        assert failures[0]["subject_id"] == "s1"
+        assert failures[0]["reason"] == "washout_not_elapsed"
+        assert failures[0]["retry_after_seconds"] == 3360
+        assert_no_sequence_leak(resp.json())
+
+        # 零写入：s2 未揭盲、s1 仍停在周期 2
+        progress_s2 = local.get(f"/experiments/{eid}/subjects/s2/progress").json()
+        assert progress_s2["reveals"] == []
+
+        # 到期后用同一 batch_id 首次成功（门禁失败不消耗幂等键）
+        clock.now += timedelta(seconds=3360)
+        ok = advance_batch(
+            local,
+            eid,
+            [
+                {"subject_id": "s1", "expected_period": 2},
+                {"subject_id": "s2", "expected_period": 1},
+            ],
+            "batch-w",
+        )
+        assert ok.status_code == 200, ok.text
+        assert [r["subject_id"] for r in ok.json()["results"]] == ["s1", "s2"]
+
+
+def test_batch_same_batch_id_replays_first_result(client: TestClient) -> None:
+    body, _ = create_experiment(
+        client, conditions=["A", "B"], subject_ids=["s1", "s2"], seed=9
+    )
+    eid = body["experiment_id"]
+    members = [
+        {"subject_id": "s1", "expected_period": 1},
+        {"subject_id": "s2", "expected_period": 1},
+    ]
+    first = advance_batch(client, eid, members, "idem-batch")
+    assert first.status_code == 200
+    first_body = first.json()
+
+    for _ in range(3):
+        retry = advance_batch(client, eid, members, "idem-batch")
+        assert retry.status_code == 200
+        assert retry.json() == first_body
+
+    # 重放不重复推进
+    for subject_id in ("s1", "s2"):
+        progress = client.get(f"/experiments/{eid}/subjects/{subject_id}/progress").json()
+        assert progress["next_period"] == 2
+        assert len(progress["reveals"]) == 1
+
+    # 即使成员已推进到更后周期，重放仍返回首次结果，不重复揭盲
+    assert complete_period(client, eid, "s1", 1, "c1").status_code == 200
+    assert client.post(
+        f"/experiments/{eid}/advance",
+        json={"subject_id": "s1", "expected_period": 2, "request_id": "a2"},
+    ).status_code == 200
+    replay = advance_batch(client, eid, members, "idem-batch")
+    assert replay.status_code == 200
+    assert replay.json() == first_body
+
+
+def test_batch_same_batch_id_different_members_returns_409(
+    client: TestClient,
+) -> None:
+    body, _ = create_experiment(
+        client, conditions=["A", "B"], subject_ids=["s1", "s2"], seed=4
+    )
+    eid = body["experiment_id"]
+
+    first = advance_batch(
+        client,
+        eid,
+        [{"subject_id": "s1", "expected_period": 1}],
+        "shared-batch",
+    )
+    assert first.status_code == 200
+
+    # 不同成员集合
+    other_members = advance_batch(
+        client,
+        eid,
+        [{"subject_id": "s2", "expected_period": 1}],
+        "shared-batch",
+    )
+    assert other_members.status_code == 409
+    detail = other_members.json()["detail"]
+    assert detail["reason"] == "batch_id_conflict"
+    assert detail["batch_id"] == "shared-batch"
+
+    # 相同成员但周期不同
+    other_period = advance_batch(
+        client,
+        eid,
+        [{"subject_id": "s1", "expected_period": 2}],
+        "shared-batch",
+    )
+    assert other_period.status_code == 409
+    assert other_period.json()["detail"]["reason"] == "batch_id_conflict"
+
+    # 相同成员但顺序不同也视为不同请求（使用全新实验避免与上面的状态叠加）
+    body2, _ = create_experiment(
+        client, conditions=["A", "B", "C", "D"],
+        subject_ids=[f"t{i}" for i in range(8)], seed=7,
+    )
+    eid2 = body2["experiment_id"]
+    two = [
+        {"subject_id": "t1", "expected_period": 1},
+        {"subject_id": "t2", "expected_period": 1},
+    ]
+    assert advance_batch(client, eid2, two, "ordered-batch").status_code == 200
+    reordered = advance_batch(
+        client, eid2, list(reversed(two)), "ordered-batch"
+    )
+    assert reordered.status_code == 409
+    assert reordered.json()["detail"]["reason"] == "batch_id_conflict"
+
+    # 冲突的失败路径零写入：t1 / t2 只保留首批各一条揭盲，未重复推进
+    for subject_id in ("t1", "t2"):
+        progress = client.get(
+            f"/experiments/{eid2}/subjects/{subject_id}/progress"
+        ).json()
+        assert progress["next_period"] == 2
+        assert len(progress["reveals"]) == 1
+
+
+def test_batch_members_validation(client: TestClient) -> None:
+    body, _ = create_experiment(
+        client, conditions=["A", "B"], subject_ids=["s1", "s2"], seed=2
+    )
+    eid = body["experiment_id"]
+
+    # 空成员列表
+    resp = advance_batch(client, eid, [], "empty")
+    assert resp.status_code == 422
+
+    # 重复的 subject_id / expected_period 对
+    resp = advance_batch(
+        client,
+        eid,
+        [
+            {"subject_id": "s1", "expected_period": 1},
+            {"subject_id": "s1", "expected_period": 1},
+        ],
+        "dup",
+    )
+    assert resp.status_code == 422
+
+    # expected_period < 1 / batch_id 为空
+    assert advance_batch(
+        client, eid, [{"subject_id": "s1", "expected_period": 0}], "bad"
+    ).status_code == 422
+    assert advance_batch(
+        client, eid, [{"subject_id": "s1", "expected_period": 1}], ""
+    ).status_code == 422
+
+    # 超过 100 个成员（受试者名册只建了 2 人，校验在入库前发生）
+    too_many = [
+        {"subject_id": f"u{i}", "expected_period": 1} for i in range(101)
+    ]
+    assert advance_batch(client, eid, too_many, "too-many").status_code == 422
+
+
+def test_batch_boundary_size_of_100_accepted(client: TestClient) -> None:
+    # 100 个互异成员（2 条件一组 2 人，100 为整组倍数）
+    subject_ids = [f"u{i}" for i in range(100)]
+    body, _ = create_experiment(
+        client,
+        conditions=["A", "B"],
+        subject_ids=subject_ids,
+        seed=1,
+    )
+    eid = body["experiment_id"]
+    members = [{"subject_id": s, "expected_period": 1} for s in subject_ids]
+    resp = advance_batch(client, eid, members, "batch-100")
+    assert resp.status_code == 200, resp.text
+    assert len(resp.json()["results"]) == 100
+    assert [r["subject_id"] for r in resp.json()["results"]] == subject_ids
+
+
+def test_batch_unknown_experiment_returns_404(client: TestClient) -> None:
+    resp = advance_batch(
+        client,
+        "missing",
+        [{"subject_id": "s1", "expected_period": 1}],
+        "b",
+    )
+    assert resp.status_code == 404
+
+
+def test_concurrent_batches_are_serialized(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("DATABASE_PATH", str(tmp_path / "conc-batch.db"))
+    with TestClient(app) as setup:
+        created = setup.post(
+            "/experiments",
+            json={
+                "conditions": ["A", "B"],
+                "subject_ids": ["s1", "s2"],
+                "seed": 21,
+            },
+        ).json()
+    eid = created["experiment_id"]
+
+    n_threads = 8
+    barrier = threading.Barrier(n_threads)
+    statuses: list[int] = []
+    statuses_lock = threading.Lock()
+
+    def worker(i: int) -> None:
+        with TestClient(app) as local_client:
+            barrier.wait()
+            resp = advance_batch(
+                local_client,
+                eid,
+                [{"subject_id": "s1", "expected_period": 1}],
+                f"batch-race-{i}",
+            )
+            with statuses_lock:
+                statuses.append(resp.status_code)
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(n_threads)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    # BEGIN IMMEDIATE 串行化：只有一批成功，其余看到 period_mismatch
+    assert statuses.count(200) == 1
+    assert statuses.count(409) == n_threads - 1
+    with TestClient(app) as verify:
+        progress = verify.get(f"/experiments/{eid}/subjects/s1/progress").json()
+    assert progress["next_period"] == 2
+    assert len(progress["reveals"]) == 1
+
+
 # ---------- 旧库启动时自动补齐表结构 ----------
 
 def test_startup_migrates_legacy_database(tmp_path, monkeypatch) -> None:

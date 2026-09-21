@@ -15,6 +15,8 @@
   推进下一周期前上一周期必须已完成且洗脱期已届满；
 * ``advance_requests`` / ``completion_requests``：推进与完成接口的
   幂等结果，按 ``(实验, request_id)`` 去重。
+* ``advance_batches``：批量受控揭盲的幂等结果，按 ``(实验, batch_id)``
+  去重，保存首次请求绑定的有序成员列表与首次揭盲结果。
 """
 
 from __future__ import annotations
@@ -96,6 +98,16 @@ CREATE TABLE IF NOT EXISTS completion_requests (
     completed_at  TEXT NOT NULL,         -- 首次结果登记的完成时刻
     PRIMARY KEY (experiment_id, request_id)
 );
+
+CREATE TABLE IF NOT EXISTS advance_batches (
+    experiment_id TEXT NOT NULL REFERENCES experiments(id),
+    batch_id      TEXT NOT NULL,
+    members       TEXT NOT NULL,         -- JSON：首次请求绑定的有序成员
+                                          -- [{subject_id, expected_period}]
+    results       TEXT NOT NULL,         -- JSON：首次结果（按输入顺序的揭盲列表）
+    created_at    TEXT NOT NULL,
+    PRIMARY KEY (experiment_id, batch_id)
+);
 """
 
 
@@ -143,6 +155,23 @@ class CompletionOrderError(Exception):
             f"completion out of order: current_period={current_period}, "
             f"already_completed={already_completed}"
         )
+
+
+class BatchIdConflictError(Exception):
+    """batch_id 已被成员列表不同的另一次批量请求占用。"""
+
+
+class BatchMembersRejectedError(Exception):
+    """批量揭盲中至少一个成员未通过门禁，整批必须零写入。
+
+    :param failures: 每个失败成员一项，键为 ``subject_id`` / ``reason``，
+        并按原因附带 ``next_period`` 或 ``retry_after_seconds``；
+        不含任何条件 / 后续安排信息。
+    """
+
+    def __init__(self, failures: list[dict[str, Any]]) -> None:
+        self.failures = failures
+        super().__init__(f"batch members rejected: {len(failures)} failure(s)")
 
 
 def utc_now() -> datetime:
@@ -414,6 +443,261 @@ def _advance_locked(
         "condition": condition,
         "request_id": request_id,
         "revealed_at": revealed_at,
+        "_replayed": False,
+    }
+
+
+def advance_batch(
+    experiment_id: str,
+    batch_id: str,
+    members: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    """在单个写事务内批量受控揭盲并推进。
+
+    流程（全部在一个 ``BEGIN IMMEDIATE`` 事务内完成）：
+
+    1. 幂等检查：``(experiment_id, batch_id)`` 已存在时，仅当本次成员列表
+       （``subject_id`` / ``expected_period`` 及顺序）与首次完全一致才返回
+       首次结果；成员或顺序不同则抛出 :class:`BatchIdConflictError`；
+    2. 门禁校验：对每个成员**先统一**做现有单条推进的全部校验——
+       受试者必须存在、``expected_period`` 必须等于其下一周期且实验未结束、
+       周期大于 1 时上一周期必须已完成且洗脱期已届满。门禁时刻以同一
+       服务端时间读取，任一项失败即汇总全部失败项并抛出
+       :class:`BatchMembersRejectedError`，**整批回滚、零写入**；
+    3. 揭盲：仅当全部成员通过后，才**按输入顺序**写入每条揭盲记录、
+       推进 ``subject_progress``，最后落盘 ``advance_batches`` 幂等结果，
+       一起提交或一起回滚。
+
+    失败项只携带 ``subject_id`` 与原因（及安全的 ``next_period`` /
+    ``retry_after_seconds``），不附带任何条件。实验不存在时返回 ``None``。
+    """
+    conn = get_connection()
+    try:
+        conn.isolation_level = None
+        conn.execute("BEGIN IMMEDIATE")
+        committed = False
+        try:
+            result = _advance_batch_locked(
+                conn, experiment_id, batch_id, members
+            )
+            if result is not None and not result["_replayed"]:
+                conn.execute("COMMIT")
+                committed = True
+            if result is not None:
+                result.pop("_replayed", None)
+            return result
+        finally:
+            if not committed:
+                conn.rollback()
+    finally:
+        conn.close()
+
+
+def _advance_batch_locked(
+    conn: sqlite3.Connection,
+    experiment_id: str,
+    batch_id: str,
+    members: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    # 1) 幂等命中：成员列表（含顺序）一致才返回首次结果，否则 409
+    batch_row = conn.execute(
+        "SELECT members, results FROM advance_batches "
+        "WHERE experiment_id = ? AND batch_id = ?",
+        (experiment_id, batch_id),
+    ).fetchone()
+    if batch_row is not None:
+        bound_members = [
+            {"subject_id": m["subject_id"], "expected_period": m["expected_period"]}
+            for m in json.loads(batch_row["members"])
+        ]
+        request_members = [
+            {"subject_id": m["subject_id"], "expected_period": m["expected_period"]}
+            for m in members
+        ]
+        if bound_members != request_members:
+            raise BatchIdConflictError()
+        return {
+            "experiment_id": experiment_id,
+            "batch_id": batch_id,
+            "results": json.loads(batch_row["results"]),
+            "_replayed": True,
+        }
+
+    # 2) 实验必须存在（决定洗脱期）
+    washout = _get_washout(conn, experiment_id)
+    if washout is None:
+        return None
+
+    # 一次取齐全部成员的序列与进度（同一事务快照，期间无其他写入）
+    subject_ids = [m["subject_id"] for m in members]
+    placeholders = ",".join("?" for _ in subject_ids)
+    assignment_rows = {
+        row["subject_id"]: row["sequence"]
+        for row in conn.execute(
+            f"SELECT subject_id, sequence FROM assignments "
+            f"WHERE experiment_id = ? AND subject_id IN ({placeholders})",
+            (experiment_id, *subject_ids),
+        ).fetchall()
+    }
+    progress_rows = {
+        row["subject_id"]: row["next_period"]
+        for row in conn.execute(
+            f"SELECT subject_id, next_period FROM subject_progress "
+            f"WHERE experiment_id = ? AND subject_id IN ({placeholders})",
+            (experiment_id, *subject_ids),
+        ).fetchall()
+    }
+
+    # 同一批内同一受试者出现两次（周期不同）时，第二个人工复制的成员
+    # 会以“推进后的下一周期”视角参与门禁校验，确保整批零写入而非部分推进
+    pending_next: dict[str, int] = {}
+    # 只取本批成员的上一周期完成时间（周期 1 无需完成记录）
+    completion_rows = {
+        (row["subject_id"], row["period"]): row["completed_at"]
+        for row in conn.execute(
+            f"SELECT subject_id, period, completed_at FROM period_completions "
+            f"WHERE experiment_id = ? AND subject_id IN ({placeholders})",
+            (experiment_id, *subject_ids),
+        ).fetchall()
+    }
+
+    # 门禁时刻：整批使用同一服务端时间（在写锁内读取）
+    gate_now = utc_now()
+
+    # 计划列表：通过门禁的成员收集其待揭盲信息；失败则汇总后整批拒绝
+    plan: list[dict[str, Any]] = []
+    failures: list[dict[str, Any]] = []
+
+    for member in members:
+        subject_id = member["subject_id"]
+        expected_period = member["expected_period"]
+        failure: dict[str, Any] | None = None
+
+        sequence_json = assignment_rows.get(subject_id)
+        if sequence_json is None:
+            failure = {"subject_id": subject_id, "reason": "subject_not_found"}
+        else:
+            sequence = json.loads(sequence_json)
+            num_periods = len(sequence)
+            next_period = pending_next.get(
+                subject_id, progress_rows.get(subject_id, 1)
+            )
+
+            if next_period > num_periods or expected_period != next_period:
+                failure = {
+                    "subject_id": subject_id,
+                    "reason": (
+                        "experiment_complete"
+                        if next_period > num_periods
+                        else "period_mismatch"
+                    ),
+                    "next_period": next_period,
+                }
+            elif next_period > 1:
+                completed_at_text = completion_rows.get(
+                    (subject_id, next_period - 1)
+                )
+                if completed_at_text is None:
+                    failure = {
+                        "subject_id": subject_id,
+                        "reason": "prior_period_not_completed",
+                    }
+                else:
+                    completed_at = datetime.fromisoformat(completed_at_text)
+                    next_available_at = completed_at + timedelta(seconds=washout)
+                    if gate_now < next_available_at:
+                        retry_after = math.ceil(
+                            (next_available_at - gate_now).total_seconds()
+                        )
+                        failure = {
+                            "subject_id": subject_id,
+                            "reason": "washout_not_elapsed",
+                            "retry_after_seconds": max(1, retry_after),
+                        }
+
+        if failure is None:
+            plan.append(
+                {
+                    "subject_id": subject_id,
+                    "period": next_period,
+                    "condition": sequence[next_period - 1],
+                }
+            )
+            # 同受试者后续成员看到推进后的下一周期
+            pending_next[subject_id] = next_period + 1
+        else:
+            failures.append(failure)
+
+    if failures:
+        # 整批零写入：不揭盲任何条件，由外层事务回滚
+        raise BatchMembersRejectedError(failures)
+
+    # 3) 全部通过：按输入顺序揭盲并推进（每条时间戳在锁内顺序生成）
+    results: list[dict[str, Any]] = []
+    for item in plan:
+        subject_id = item["subject_id"]
+        period = item["period"]
+        condition = item["condition"]
+        # 批量揭盲在 advance_requests 之外使用带前缀的派生幂等键，
+        # 与单条推进的 request_id 空间互不干扰
+        derived_request_id = f"batch:{batch_id}:{subject_id}:{period}"
+        revealed_at = utc_now().isoformat()
+
+        conn.execute(
+            "INSERT INTO unblindings "
+            "(experiment_id, subject_id, period, condition, request_id, revealed_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                experiment_id,
+                subject_id,
+                period,
+                condition,
+                derived_request_id,
+                revealed_at,
+            ),
+        )
+        conn.execute(
+            "INSERT INTO subject_progress "
+            "(experiment_id, subject_id, next_period, updated_at) "
+            "VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(experiment_id, subject_id) DO UPDATE SET "
+            "next_period = excluded.next_period, updated_at = excluded.updated_at",
+            (experiment_id, subject_id, period + 1, revealed_at),
+        )
+        results.append(
+            {
+                "experiment_id": experiment_id,
+                "subject_id": subject_id,
+                "period": period,
+                "condition": condition,
+                "request_id": derived_request_id,
+                "revealed_at": revealed_at,
+            }
+        )
+
+    conn.execute(
+        "INSERT INTO advance_batches "
+        "(experiment_id, batch_id, members, results, created_at) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (
+            experiment_id,
+            batch_id,
+            json.dumps(
+                [
+                    {"subject_id": m["subject_id"], "expected_period": m["expected_period"]}
+                    for m in members
+                ],
+                ensure_ascii=False,
+            ),
+            json.dumps(results, ensure_ascii=False),
+            gate_now.isoformat(),
+        ),
+    )
+
+    return {
+        "experiment_id": experiment_id,
+        "batch_id": batch_id,
+        "results": results,
         "_replayed": False,
     }
 
